@@ -1,19 +1,40 @@
 import warnings
+from typing import Sequence
+
 import torch
-import math
-
-import torch.nn as nn
 import torch.utils.checkpoint as cp
-
-from mmcv.cnn import build_conv_layer, build_norm_layer
+import torch.nn as nn
+from mmcv.cnn import build_norm_layer, build_conv_layer, build_plugin_layer
 from mmengine.model import BaseModule
 from torch.nn.modules.batchnorm import _BatchNorm
-
-from mmdet.models.backbones.resnet import Bottleneck as _Bottleneck
+from ..layers import ResLayer
 from mmdet.registry import MODELS
 
-from .resnet_custom import RFTM
-from ..detectors_resnet import ResLayer
+
+class RFTM(nn.Module):
+    """
+
+    """
+
+    def __init__(self, in_channels, out_channels):
+        super(RFTM, self).__init__()
+
+        self.pooling = nn.MaxPool2d((2, 2), 2)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, (3, 3), 1, 1)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, (3, 3), 1, 1)
+        self.conv3 = nn.Conv2d(out_channels, out_channels, (3, 3), 1, 1)
+
+        self.relu = nn.ReLU()
+
+    def forward(self, fea):
+        fea = self.pooling(fea)
+        fea = self.conv1(fea)
+        fea = self.relu(fea)
+        fea = self.conv2(fea)
+        fea = self.relu(fea)
+        fea = self.conv3(fea)
+
+        return fea
 
 
 class BasicBlock(BaseModule):
@@ -99,169 +120,304 @@ class BasicBlock(BaseModule):
         return out
 
 
-class Bottleneck(_Bottleneck):
+class Bottleneck(BaseModule):
     expansion = 4
 
     def __init__(self,
                  inplanes,
                  planes,
-                 groups=1,
-                 base_width=4,
-                 base_channels=64,
-                 **kwargs):
-        """Bottleneck block for ResNeXt.
+                 stride=1,
+                 dilation=1,
+                 downsample=None,
+                 style='pytorch',
+                 with_cp=False,
+                 conv_cfg=None,
+                 norm_cfg=dict(type='BN'),
+                 dcn=None,
+                 plugins=None,
+                 init_cfg=None):
+        """Bottleneck block for ResNet.
 
         If style is "pytorch", the stride-two layer is the 3x3 conv layer, if
         it is "caffe", the stride-two layer is the first 1x1 conv layer.
         """
-        super(Bottleneck, self).__init__(inplanes, planes, **kwargs)
+        super(Bottleneck, self).__init__(init_cfg)
+        assert style in ['pytorch', 'caffe']
+        assert dcn is None or isinstance(dcn, dict)
+        assert plugins is None or isinstance(plugins, list)
+        if plugins is not None:
+            allowed_position = ['after_conv1', 'after_conv2', 'after_conv3']
+            assert all(p['position'] in allowed_position for p in plugins)
 
-        if groups == 1:
-            width = self.planes
+        self.inplanes = inplanes
+        self.planes = planes
+        self.stride = stride
+        self.dilation = dilation
+        self.style = style
+        self.with_cp = with_cp
+        self.conv_cfg = conv_cfg
+        self.norm_cfg = norm_cfg
+        self.dcn = dcn
+        self.with_dcn = dcn is not None
+        self.plugins = plugins
+        self.with_plugins = plugins is not None
+
+        if self.with_plugins:
+            # collect plugins for conv1/conv2/conv3
+            self.after_conv1_plugins = [
+                plugin['cfg'] for plugin in plugins
+                if plugin['position'] == 'after_conv1'
+            ]
+            self.after_conv2_plugins = [
+                plugin['cfg'] for plugin in plugins
+                if plugin['position'] == 'after_conv2'
+            ]
+            self.after_conv3_plugins = [
+                plugin['cfg'] for plugin in plugins
+                if plugin['position'] == 'after_conv3'
+            ]
+
+        if self.style == 'pytorch':
+            self.conv1_stride = 1
+            self.conv2_stride = stride
         else:
-            width = math.floor(self.planes *
-                               (base_width / base_channels)) * groups
+            self.conv1_stride = stride
+            self.conv2_stride = 1
 
-        self.norm1_name, norm1 = build_norm_layer(
-            self.norm_cfg, width, postfix=1)
-        self.norm2_name, norm2 = build_norm_layer(
-            self.norm_cfg, width, postfix=2)
+        self.norm1_name, norm1 = build_norm_layer(norm_cfg, planes, postfix=1)
+        self.norm2_name, norm2 = build_norm_layer(norm_cfg, planes, postfix=2)
         self.norm3_name, norm3 = build_norm_layer(
-            self.norm_cfg, self.planes * self.expansion, postfix=3)
+            norm_cfg, planes * self.expansion, postfix=3)
 
         self.conv1 = build_conv_layer(
-            self.conv_cfg,
-            self.inplanes,
-            width,
+            conv_cfg,
+            inplanes,
+            planes,
             kernel_size=1,
             stride=self.conv1_stride,
             bias=False)
         self.add_module(self.norm1_name, norm1)
         fallback_on_stride = False
-        self.with_modulated_dcn = False
         if self.with_dcn:
-            fallback_on_stride = self.dcn.pop('fallback_on_stride', False)
+            fallback_on_stride = dcn.pop('fallback_on_stride', False)
         if not self.with_dcn or fallback_on_stride:
             self.conv2 = build_conv_layer(
-                self.conv_cfg,
-                width,
-                width,
+                conv_cfg,
+                planes,
+                planes,
                 kernel_size=3,
                 stride=self.conv2_stride,
-                padding=self.dilation,
-                dilation=self.dilation,
-                groups=groups,
+                padding=dilation,
+                dilation=dilation,
                 bias=False)
         else:
             assert self.conv_cfg is None, 'conv_cfg must be None for DCN'
             self.conv2 = build_conv_layer(
-                self.dcn,
-                width,
-                width,
+                dcn,
+                planes,
+                planes,
                 kernel_size=3,
                 stride=self.conv2_stride,
-                padding=self.dilation,
-                dilation=self.dilation,
-                groups=groups,
+                padding=dilation,
+                dilation=dilation,
                 bias=False)
 
         self.add_module(self.norm2_name, norm2)
         self.conv3 = build_conv_layer(
-            self.conv_cfg,
-            width,
-            self.planes * self.expansion,
+            conv_cfg,
+            planes,
+            planes * self.expansion,
             kernel_size=1,
             bias=False)
         self.add_module(self.norm3_name, norm3)
 
-        if self.with_plugins:
-            self._del_block_plugins(self.after_conv1_plugin_names +
-                                    self.after_conv2_plugin_names +
-                                    self.after_conv3_plugin_names)
-            self.after_conv1_plugin_names = self.make_block_plugins(
-                width, self.after_conv1_plugins)
-            self.after_conv2_plugin_names = self.make_block_plugins(
-                width, self.after_conv2_plugins)
-            self.after_conv3_plugin_names = self.make_block_plugins(
-                self.planes * self.expansion, self.after_conv3_plugins)
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
 
-    def _del_block_plugins(self, plugin_names):
-        """delete plugins for block if exist.
+        if self.with_plugins:
+            self.after_conv1_plugin_names = self.make_block_plugins(
+                planes, self.after_conv1_plugins)
+            self.after_conv2_plugin_names = self.make_block_plugins(
+                planes, self.after_conv2_plugins)
+            self.after_conv3_plugin_names = self.make_block_plugins(
+                planes * self.expansion, self.after_conv3_plugins)
+
+    def make_block_plugins(self, in_channels, plugins):
+        """make plugins for block.
 
         Args:
-            plugin_names (list[str]): List of plugins name to delete.
+            in_channels (int): Input channels of plugin.
+            plugins (list[dict]): List of plugins cfg to build.
+
+        Returns:
+            list[str]: List of the names of plugin.
         """
-        assert isinstance(plugin_names, list)
-        for plugin_name in plugin_names:
-            del self._modules[plugin_name]
+        assert isinstance(plugins, list)
+        plugin_names = []
+        for plugin in plugins:
+            plugin = plugin.copy()
+            name, layer = build_plugin_layer(
+                plugin,
+                in_channels=in_channels,
+                postfix=plugin.pop('postfix', ''))
+            assert not hasattr(self, name), f'duplicate plugin {name}'
+            self.add_module(name, layer)
+            plugin_names.append(name)
+        return plugin_names
+
+    def forward_plugin(self, x, plugin_names):
+        out = x
+        for name in plugin_names:
+            out = getattr(self, name)(x)
+        return out
+
+    @property
+    def norm1(self):
+        """nn.Module: normalization layer after the first convolution layer"""
+        return getattr(self, self.norm1_name)
+
+    @property
+    def norm2(self):
+        """nn.Module: normalization layer after the second convolution layer"""
+        return getattr(self, self.norm2_name)
+
+    @property
+    def norm3(self):
+        """nn.Module: normalization layer after the third convolution layer"""
+        return getattr(self, self.norm3_name)
+
+    def forward(self, x):
+        """Forward function."""
+
+        def _inner_forward(x):
+            identity = x
+            out = self.conv1(x)
+            out = self.norm1(out)
+            out = self.relu(out)
+
+            if self.with_plugins:
+                out = self.forward_plugin(out, self.after_conv1_plugin_names)
+
+            out = self.conv2(out)
+            out = self.norm2(out)
+            out = self.relu(out)
+
+            if self.with_plugins:
+                out = self.forward_plugin(out, self.after_conv2_plugin_names)
+
+            out = self.conv3(out)
+            out = self.norm3(out)
+
+            if self.with_plugins:
+                out = self.forward_plugin(out, self.after_conv3_plugin_names)
+
+            if self.downsample is not None:
+                identity = self.downsample(x)
+
+            out += identity
+
+            return out
+
+        if self.with_cp and x.requires_grad:
+            out = cp.checkpoint(_inner_forward, x)
+        else:
+            out = _inner_forward(x)
+
+        out = self.relu(out)
+
+        return out
 
 
 @MODELS.register_module()
-class ResNeXtCustom(BaseModule):
-    """ResNeXt backbone.
+class ResNetCustom(BaseModule):
+    """ResNet backbone.
 
     Args:
         depth (int): Depth of resnet, from {18, 34, 50, 101, 152}.
+        stem_channels (int | None): Number of stem channels. If not specified,
+            it will be the same as `base_channels`. Default: None.
+        base_channels (int): Number of base channels of res layer. Default: 64.
         in_channels (int): Number of input image channels. Default: 3.
         num_stages (int): Resnet stages. Default: 4.
-        groups (int): Group of resnext.
-        base_width (int): Base width of resnext.
         strides (Sequence[int]): Strides of the first block of each stage.
         dilations (Sequence[int]): Dilation of each stage.
         out_indices (Sequence[int]): Output from which stages.
         style (str): `pytorch` or `caffe`. If set to "pytorch", the stride-two
             layer is the 3x3 conv layer, otherwise the stride-two layer is
             the first 1x1 conv layer.
-        frozen_stages (int): Stages to be frozen (all param fixed). -1 means
-            not freezing any parameters.
-        norm_cfg (dict): dictionary to construct and config norm layer.
+        deep_stem (bool): Replace 7x7 conv in input stem with 3 3x3 conv
+        avg_down (bool): Use AvgPool instead of stride conv when
+            downsampling in the bottleneck.
+        frozen_stages (int): Stages to be frozen (stop grad and set eval mode).
+            -1 means not freezing any parameters.
+        norm_cfg (dict): Dictionary to construct and config norm layer.
         norm_eval (bool): Whether to set norm layers to eval mode, namely,
             freeze running stats (mean and var). Note: Effect on Batch Norm
             and its variants only.
+        plugins (list[dict]): List of plugins for stages, each dict contains:
+
+            - cfg (dict, required): Cfg dict to build plugin.
+            - position (str, required): Position inside block to insert
+              plugin, options are 'after_conv1', 'after_conv2', 'after_conv3'.
+            - stages (tuple[bool], optional): Stages to apply plugin, length
+              should be same as 'num_stages'.
         with_cp (bool): Use checkpoint or not. Using checkpoint will save some
             memory while slowing down the training speed.
-        zero_init_residual (bool): whether to use zero init for last norm layer
+        zero_init_residual (bool): Whether to use zero init for last norm layer
             in resblocks to let them behave as identity.
+        pretrained (str, optional): model pretrained path. Default: None
+        init_cfg (dict or list[dict], optional): Initialization config dict.
+            Default: None
         use_RFTM (bool, optional): if use RFTM in model. Defauilt: False
+
+    Example:
+        >>> from mmdet.models import ResNet
+        >>> import torch
+        >>> self = ResNet(depth=18)
+        >>> self.eval()
+        >>> inputs = torch.rand(1, 3, 32, 32)
+        >>> level_outputs = self.forward(inputs)
+        >>> for level_out in level_outputs:
+        ...     print(tuple(level_out.shape))
+        (1, 64, 8, 8)
+        (1, 128, 4, 4)
+        (1, 256, 2, 2)
+        (1, 512, 1, 1)
     """
 
     arch_settings = {
+        18: (BasicBlock, (2, 2, 2, 2)),
+        34: (BasicBlock, (3, 4, 6, 3)),
         50: (Bottleneck, (3, 4, 6, 3)),
         101: (Bottleneck, (3, 4, 23, 3)),
         152: (Bottleneck, (3, 8, 36, 3))
     }
 
-
     def __init__(self,
-                depth,
-                groups=1, 
-                base_width=4,
-                in_channels=3,
-                stem_channels=None,
-                base_channels=64,
-                num_stages=4,
-                strides=(1, 2, 2, 2),
-                dilations=(1, 1, 1, 1),
-                out_indices=(0, 1, 2, 3),
-                style='pytorch',
-                deep_stem=False,
-                avg_down=False,
-                frozen_stages=-1,
-                conv_cfg=None,
-                norm_cfg=dict(type='BN', requires_grad=True),
-                norm_eval=True,
-                dcn=None,
-                stage_with_dcn=(False, False, False, False),
-                plugins=None,
-                with_cp=False,
-                zero_init_residual=True,
-                pretrained=None,
-                init_cfg=None,
-                use_RFTM=False
-                ):
-        self.groups = groups
-        self.base_width = base_width
-        super(ResNeXtCustom, self).__init__(init_cfg)
+                 depth,
+                 in_channels=3,
+                 stem_channels=None,
+                 base_channels=64,
+                 num_stages=4,
+                 strides=(1, 2, 2, 2),
+                 dilations=(1, 1, 1, 1),
+                 out_indices=(0, 1, 2, 3),
+                 style='pytorch',
+                 deep_stem=False,
+                 avg_down=False,
+                 frozen_stages=-1,
+                 conv_cfg=None,
+                 norm_cfg=dict(type='BN', requires_grad=True),
+                 norm_eval=True,
+                 dcn=None,
+                 stage_with_dcn=(False, False, False, False),
+                 plugins=None,
+                 with_cp=False,
+                 zero_init_residual=True,
+                 pretrained=None,
+                 init_cfg=None,
+                 use_RFTM=False):
+        super(ResNetCustom, self).__init__(init_cfg)
         self.zero_init_residual = zero_init_residual
         if depth not in self.arch_settings:
             raise KeyError(f'invalid depth {depth} for resnet')
@@ -325,11 +481,12 @@ class ResNeXtCustom(BaseModule):
         self.block, stage_blocks = self.arch_settings[depth]
         self.stage_blocks = stage_blocks[:num_stages]
         self.inplanes = stem_channels
+
         self._make_stem_layer(in_channels, stem_channels)
-        self.res_layers = []
 
         self.use_RFTM = use_RFTM
 
+        self.res_layers = []
         for i, num_blocks in enumerate(self.stage_blocks):
             stride = strides[i]
             dilation = dilations[i]
@@ -339,9 +496,10 @@ class ResNeXtCustom(BaseModule):
             else:
                 stage_plugins = None
             planes = base_channels * 2**i
+
             if self.use_RFTM and i == 1:
                 self.RFTM = RFTM(self.inplanes, planes * 4)
-            
+
             res_layer = self.make_res_layer(
                 block=self.block,
                 inplanes=self.inplanes,
@@ -361,8 +519,7 @@ class ResNeXtCustom(BaseModule):
             layer_name = f'layer{i + 1}'
             self.add_module(layer_name, res_layer)
             self.res_layers.append(layer_name)
-
-
+        
         self._freeze_stages()
 
         self.feat_dim = self.block.expansion * base_channels * 2**(
@@ -431,12 +588,8 @@ class ResNeXtCustom(BaseModule):
         return stage_plugins
 
     def make_res_layer(self, **kwargs):
-        """Pack all blocks in a stage into a ``ResLayer``"""
-        return ResLayer(
-            groups=self.groups,
-            base_width=self.base_width,
-            base_channels=self.base_channels,
-            **kwargs)
+        """Pack all blocks in a stage into a ``ResLayer``."""
+        return ResLayer(**kwargs)
 
     @property
     def norm1(self):
@@ -517,6 +670,7 @@ class ResNeXtCustom(BaseModule):
             x = self.conv1(x)
             x = self.norm1(x)
             x = self.relu(x)
+
         x = self.maxpool(x)
         outs = []
         for i, layer_name in enumerate(self.res_layers):
@@ -525,10 +679,21 @@ class ResNeXtCustom(BaseModule):
             if i in self.out_indices:
                 outs.append(x)
         return tuple(outs)
-    
-    def forward_first_two_stages(self, x, RFTM_on = False):
+
+    def train(self, mode=True):
+        """Convert the model into training mode while keep normalization layer
+        freezed."""
+        super(ResNetCustom, self).train(mode)
+        self._freeze_stages()
+        if mode and self.norm_eval:
+            for m in self.modules():
+                # trick: eval have effect on BatchNorm only
+                if isinstance(m, _BatchNorm):
+                    m.eval()
+
+    def forward_first_two_stages(self, x, RFTM_on=False):
         # forward HD_u: RFTM on
-        
+
         if self.deep_stem:
             x = self.stem(x)
         else:
@@ -537,7 +702,6 @@ class ResNeXtCustom(BaseModule):
             x = self.relu(x)
         x = self.maxpool(x)
 
-        # output only UI is forwarding
         if not RFTM_on:
             self.outs = []
         for i in range(2):
@@ -562,17 +726,3 @@ class ResNeXtCustom(BaseModule):
             if i in self.out_indices:
                 self.outs.append(x)
         return tuple(self.outs)
-
-    def train(self, mode=True):
-        """Convert the model into training mode while keep normalization layer
-        freezed."""
-        super(ResNeXtCustom, self).train(mode)
-        self._freeze_stages()
-        if mode and self.norm_eval:
-            for m in self.modules():
-                # trick: eval have effect on BatchNorm only
-                if isinstance(m, _BatchNorm):
-                    m.eval()
-
-
-

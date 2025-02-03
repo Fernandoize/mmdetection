@@ -1,12 +1,20 @@
 default_scope = 'mmdet'
 
 default_hooks = dict(
+    # 随着Iter变化，更新epoch花费时间
     timer=dict(type='IterTimerHook'),
+    # 日志间隔，包括terminal, tensorboard, wandb
     logger=dict(type='LoggerHook', interval=50),
+    # 超参更新
     param_scheduler=dict(type='ParamSchedulerHook'),
+    # 保存checkpoint
     checkpoint=dict(type='CheckpointHook', interval=1),
+    # 允许分布式sampler
     sampler_seed=dict(type='DistSamplerSeedHook'),
+    # 验证和测试结果可视化
     visualization=dict(type='DetVisualizationHook'))
+
+custom_hooks = []
 
 env_cfg = dict(
     cudnn_benchmark=False,
